@@ -312,6 +312,7 @@ function serializeNodeCompact(node) {
     if (node.user.role) o.u.r = node.user.role;
   }
   if (node.telemetry && node.telemetry.batteryLevel) o.bat = node.telemetry.batteryLevel;
+  if (node.mapReport && node.mapReport.firmwareVersion) o.fw = node.mapReport.firmwareVersion;
   if (node.snr) o.snr = node.snr;
   return o;
 }

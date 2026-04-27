@@ -194,6 +194,7 @@
     if (n.position.altitude) h += `<div class="popup-field"><div class="popup-label">Altitude</div><div class="popup-value">${n.position.altitude}m</div></div>`;
     if (n.telemetry && n.telemetry.batteryLevel > 0) h += `<div class="popup-field"><div class="popup-label">Battery</div><div class="popup-value">${n.telemetry.batteryLevel}%</div></div>`;
     if (n.snr) h += `<div class="popup-field"><div class="popup-label">SNR</div><div class="popup-value">${n.snr.toFixed(1)} dB</div></div>`;
+    if (n.mapReport && n.mapReport.firmwareVersion) h += `<div class="popup-field"><div class="popup-label">Firmware</div><div class="popup-value">${escHtml(n.mapReport.firmwareVersion)}</div></div>`;
     h += `<div class="popup-field full"><div class="popup-label">Last Seen</div><div class="popup-value">${lastSeen}</div></div></div></div>`;
 
     // Unbind any existing popup first, then rebind — fixes second-click bug
@@ -224,10 +225,11 @@
 
   // ─── Compact Node Deserialization ─────────────────────────────────────────
   function expandCompactNode(c) {
-    const node = { id: c.id, lastHeard: c.lh, position: null, user: null, telemetry: null, snr: c.snr || 0, rssi: 0 };
+    const node = { id: c.id, lastHeard: c.lh, position: null, user: null, telemetry: null, snr: c.snr || 0, rssi: 0, mapReport: null };
     if (c.p) node.position = { lat: c.p[0], lon: c.p[1], altitude: c.p[2] || 0 };
     if (c.u) node.user = { longName: c.u.l || '', shortName: c.u.s || '', hwModel: c.u.h || 0, role: c.u.r || 0 };
     if (c.bat) node.telemetry = { batteryLevel: c.bat };
+    if (c.fw) node.mapReport = { firmwareVersion: c.fw };
     return node;
   }
 
