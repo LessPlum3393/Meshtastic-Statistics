@@ -644,6 +644,17 @@
           batchLoadNodes(data.nodes || []);
           updateStats(data.stats);
           if (state.activeTab === 'charts') updateAllCharts();
+        } else if (data.type === 'refresh') {
+          // Periodic full refresh from server (every 10 minutes)
+          // Remove nodes that are no longer in the server's active set
+          const serverNodeIds = new Set((data.nodes || []).map(n => n.id));
+          for (const id of state.nodes.keys()) {
+            if (!serverNodeIds.has(id)) removeNode(id);
+          }
+          // Upsert all nodes from server
+          (data.nodes || []).forEach(n => upsertNode(n));
+          updateStats(data.stats || null);
+          appendLiveHistory();
         } else if (data.type === 'batch') {
           (data.updates || []).forEach(u => {
             if (!u) return;

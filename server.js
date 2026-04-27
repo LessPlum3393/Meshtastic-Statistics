@@ -818,7 +818,7 @@ async function main() {
     console.log(`📊 Nodes: ${nodes.size} | With Position: ${stats.nodesWithPosition} | Total Packets: ${stats.totalPackets} | History Points: ${history.length}`);
   }, 30000);
 
-  // Periodic cleanup of stale nodes
+  // Periodic cleanup of stale nodes (every 10 minutes)
   setInterval(() => {
     const cutoff = Date.now() - NODE_INACTIVE_MS;
     for (const [key, node] of nodes) {
@@ -830,7 +830,23 @@ async function main() {
         dirtyStats = true;
       }
     }
-  }, 60 * 60 * 1000);
+  }, 10 * 60 * 1000);
+
+  // Periodic full-node broadcast to all clients (every 10 minutes)
+  // Ensures connected clients always have fresh data even if no new MQTT packets arrive
+  setInterval(() => {
+    if (openClientCount === 0) return;
+    const allNodes = [...nodes.values()]
+      .filter(n => n.position && isNodeActive(n))
+      .map(serializeNode);
+    const payload = JSON.stringify({ type: 'refresh', nodes: allNodes, stats });
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(payload);
+      }
+    });
+    console.log(`🔄 Broadcast full refresh to ${openClientCount} client(s): ${allNodes.length} nodes`);
+  }, 10 * 60 * 1000);
 }
 
 main().catch(err => {
