@@ -40,7 +40,6 @@ This application connects to the official public Meshtastic MQTT broker, listens
    - Include `LongFast` (more traffic/CPU): set `MESHTASTIC_INCLUDE_LONGFAST=1`
    - Include *all* channels/presets (max traffic, fastest discovery): set `MESHTASTIC_INCLUDE_ALL_CHANNELS=1`
    - Data persistence (nodes + chart history): `DATA_SAVE=true` (default). Set `DATA_SAVE=false` to disable.
-     (Also accepts `data-save=true/false`.)
    - Default database file: `meshtastic-data.db` (override with `MESHTASTIC_DB_PATH`)
    - Hide/delete inactive nodes: `NODE_UNACTIVE=1440` (minutes, default = 24 hours)
 
