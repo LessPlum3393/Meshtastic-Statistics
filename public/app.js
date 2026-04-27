@@ -324,7 +324,6 @@
     }
 
     state.nodes.set(node.id, node);
-    scheduleNodeListUpdate();
   }
 
   // ─── Compact Node Deserialization ─────────────────────────────────────────
@@ -996,11 +995,7 @@
       updateNodeList();
     });
 
-    // Periodic refresh
-    setInterval(() => {
-      state.nodeListDirty = true;
-      scheduleNodeListUpdate();
-    }, 30000);
+
   }
 
   // ─── Bootstrap ─────────────────────────────────────────────────────────────
