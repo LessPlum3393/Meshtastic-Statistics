@@ -80,6 +80,20 @@
     return data.filter(d => d.t >= cutoff);
   }
 
+  // ─── Geo helpers ──────────────────────────────────────────────────────────
+  function distanceMeters(aLat, aLon, bLat, bLon) {
+    const toRad = (x) => x * Math.PI / 180;
+    const R = 6371000;
+    const dLat = toRad(bLat - aLat);
+    const dLon = toRad(bLon - aLon);
+    const lat1 = toRad(aLat);
+    const lat2 = toRad(bLat);
+    const s1 = Math.sin(dLat / 2);
+    const s2 = Math.sin(dLon / 2);
+    const h = s1 * s1 + Math.cos(lat1) * Math.cos(lat2) * s2 * s2;
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+  }
+
   function formatTimeLabel(ts, range) {
     const d = new Date(ts);
     if (range === '1d') return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -165,6 +179,9 @@
       zoomToBoundsOnClick: true,
       disableClusteringAtZoom: 16,
       animate: true,
+      // Reduce jitter while zooming/panning.
+      updateWhenZooming: false,
+      updateWhenIdle: true,
       animateAddingMarkers: false,
       chunkedLoading: true,
       chunkInterval: 100,
@@ -239,11 +256,35 @@
 
   // ─── Node Upsert ──────────────────────────────────────────────────────────
   function upsertNode(node) {
-    state.nodes.set(node.id, node);
+    const prev = state.nodes.get(node.id) || null;
+    const prevPos = prev && prev.position;
     if (node.position) {
       if (state.markers.has(node.id)) {
         const m = state.markers.get(node.id);
-        m.setLatLng([node.position.lat, node.position.lon]);
+
+        // Avoid "crazy moving" pins: ignore tiny jitter and throttle rapid moves.
+        // Still updates node metadata in state.nodes every time.
+        const now = Date.now();
+        const lastMoveAt = m._meshLastMoveAt || 0;
+        const meters = prevPos ? distanceMeters(prevPos.lat, prevPos.lon, node.position.lat, node.position.lon) : Infinity;
+        const tooSoon = now - lastMoveAt < 1500;
+        const tinyJitter = meters < 15;
+
+        // Reject obvious outliers (bad packets) that create huge teleports.
+        const lastAcceptedAt = m._meshLastAcceptedPosAt || 0;
+        const dt = lastAcceptedAt ? (now - lastAcceptedAt) : 0;
+        const speed = dt > 0 ? (meters / (dt / 1000)) : 0; // m/s
+        const isTeleport = meters > 2000 && dt > 0 && speed > 200; // >2km at >720km/h
+
+        if (!isTeleport && !(tooSoon && tinyJitter)) {
+          m._meshLastMoveAt = now;
+          m._meshLastAcceptedPosAt = now;
+          m.setLatLng([node.position.lat, node.position.lon]);
+        } else if (isTeleport && prevPos) {
+          // Keep state consistent with what the user sees on the map.
+          node = Object.assign({}, node, { position: prevPos });
+        }
+
         const rc = ROLE_CLASSES[(node.user && node.user.role) || 0] || '';
         if (m._meshRoleClass !== rc) {
           m._meshRoleClass = rc;
@@ -258,6 +299,8 @@
         if (m) { state.markers.set(node.id, m); state.clusterGroup.addLayer(m); }
       }
     }
+
+    state.nodes.set(node.id, node);
     scheduleNodeListUpdate();
   }
 
@@ -602,9 +645,16 @@
           updateStats(data.stats);
           if (state.activeTab === 'charts') updateAllCharts();
         } else if (data.type === 'batch') {
-          (data.updates || []).forEach(u => { if (u.node) upsertNode(u.node); });
+          (data.updates || []).forEach(u => {
+            if (!u) return;
+            if (u.type === 'remove' && u.id) removeNode(u.id);
+            else if (u.node) upsertNode(u.node);
+          });
           updateStats(data.stats || null);
           appendLiveHistory();
+        } else if (data.type === 'remove' && data.id) {
+          removeNode(data.id);
+          updateStats(data.stats || null);
         } else if (data.node) {
           upsertNode(data.node);
           updateStats(data.stats || null);
@@ -621,6 +671,25 @@
     };
 
     state.ws.onerror = () => state.ws.close();
+  }
+
+  function removeNode(nodeId) {
+    const id = String(nodeId);
+    state.nodes.delete(id);
+
+    const m = state.markers.get(id);
+    if (m) {
+      state.clusterGroup.removeLayer(m);
+      state.markers.delete(id);
+    }
+
+    if (state.selectedNodeId === id) {
+      state.selectedNodeId = null;
+      const detail = document.getElementById('nodeDetail');
+      if (detail) detail.classList.add('hidden');
+    }
+
+    scheduleNodeListUpdate();
   }
 
   function setConnectionStatus(connected) {

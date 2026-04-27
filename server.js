@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const mqtt = require('mqtt');
@@ -6,6 +7,7 @@ const crypto = require('crypto');
 const WebSocket = require('ws');
 const path = require('path');
 const fs = require('fs');
+const { DatabaseSync } = require('node:sqlite');
 
 function parseBoolEnv(name, defaultValue) {
   const raw = process.env[name];
@@ -14,6 +16,13 @@ function parseBoolEnv(name, defaultValue) {
   if (v === '1' || v === 'true' || v === 'yes' || v === 'y' || v === 'on') return true;
   if (v === '0' || v === 'false' || v === 'no' || v === 'n' || v === 'off') return false;
   return defaultValue;
+}
+
+function parseNumberEnv(name, defaultValue) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return defaultValue;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : defaultValue;
 }
 
 function getMqttTopics() {
@@ -61,7 +70,7 @@ const CONFIG = {
 // ─── In-Memory Node Store ────────────────────────────────────────────────────
 const nodes = new Map();
 let stats = { totalPackets: 0, positionPackets: 0, nodesWithPosition: 0 };
-const SERVER_STARTED_AT = Date.now();
+let SERVER_STARTED_AT = Date.now();
 
 // ─── Time-Series History ─────────────────────────────────────────────────────
 // Records a snapshot every 10 seconds. Keeps all data since server start.
@@ -69,79 +78,170 @@ const history = []; // { t: timestamp, n: nodeCount, p: totalPackets }
 const HISTORY_INTERVAL = 10000; // 10s
 
 // ─── Persistence (optional) ──────────────────────────────────────────────────
-const CACHE_ENABLED = parseBoolEnv('MESHTASTIC_CACHE_ENABLED', true);
-const CACHE_PATH = process.env.MESHTASTIC_CACHE_PATH
-  ? path.resolve(process.env.MESHTASTIC_CACHE_PATH)
-  : path.join(__dirname, 'nodes-cache.json');
-const CACHE_SAVE_INTERVAL_MS = Number(process.env.MESHTASTIC_CACHE_SAVE_INTERVAL_MS || 60000);
-const CACHE_MAX_NODES = Number(process.env.MESHTASTIC_CACHE_MAX_NODES || 25000);
-let cacheDirty = false;
+// Config: DATA_SAVE=true (default). Also accepts data-save=true.
+const DATA_SAVE_ENABLED = parseBoolEnv('DATA_SAVE', parseBoolEnv('data-save', true));
+const DB_PATH = process.env.MESHTASTIC_DB_PATH
+  ? path.resolve(process.env.MESHTASTIC_DB_PATH)
+  : path.join(__dirname, 'meshtastic-data.db');
+const DB_FLUSH_INTERVAL_MS = Number(process.env.MESHTASTIC_DB_FLUSH_INTERVAL_MS || 30000);
+const DB_MAX_NODES = Number(process.env.MESHTASTIC_DB_MAX_NODES || 50000);
+const NODE_UNACTIVE_MINUTES = parseNumberEnv('NODE_UNACTIVE', 24 * 60);
+const NODE_UNACTIVE_MS = Math.max(1, NODE_UNACTIVE_MINUTES) * 60 * 1000;
+
+let db = null;
+let stmtMetaGet, stmtMetaSet, stmtNodeUpsert, stmtNodeDelete, stmtNodeCount, stmtNodePrune, stmtHistoryUpsert;
+const dirtyNodeIds = new Set();
+let dirtyStats = false;
+let pendingHistory = [];
+
+function initDbAndLoad() {
+  if (!DATA_SAVE_ENABLED) return;
+
+  try {
+    db = new DatabaseSync(DB_PATH);
+    db.exec('PRAGMA journal_mode=WAL;');
+    db.exec('PRAGMA synchronous=NORMAL;');
+    db.exec('PRAGMA temp_store=MEMORY;');
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS nodes (
+        id TEXT PRIMARY KEY,
+        lastHeard INTEGER NOT NULL,
+        json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_nodes_lastHeard ON nodes(lastHeard);
+      CREATE TABLE IF NOT EXISTS history (
+        t INTEGER PRIMARY KEY,
+        n INTEGER NOT NULL,
+        p INTEGER NOT NULL
+      );
+    `);
+
+    stmtMetaGet = db.prepare('SELECT value FROM meta WHERE key = ?');
+    stmtMetaSet = db.prepare('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+    stmtNodeUpsert = db.prepare('INSERT INTO nodes(id, lastHeard, json) VALUES(?, ?, ?) ON CONFLICT(id) DO UPDATE SET lastHeard = excluded.lastHeard, json = excluded.json');
+    stmtNodeDelete = db.prepare('DELETE FROM nodes WHERE id = ?');
+    stmtNodeCount = db.prepare('SELECT COUNT(*) AS c FROM nodes');
+    stmtNodePrune = db.prepare('DELETE FROM nodes WHERE id IN (SELECT id FROM nodes ORDER BY lastHeard ASC LIMIT ?)');
+    stmtHistoryUpsert = db.prepare('INSERT INTO history(t, n, p) VALUES(?, ?, ?) ON CONFLICT(t) DO UPDATE SET n = excluded.n, p = excluded.p');
+    const stmtDeleteInactive = db.prepare('DELETE FROM nodes WHERE lastHeard < ?');
+
+    const startedAtRow = stmtMetaGet.get('startedAt');
+    if (startedAtRow && startedAtRow.value) {
+      const parsed = Number(startedAtRow.value);
+      if (Number.isFinite(parsed) && parsed > 0) SERVER_STARTED_AT = parsed;
+    } else {
+      stmtMetaSet.run('startedAt', String(SERVER_STARTED_AT));
+    }
+
+    const totalPacketsRow = stmtMetaGet.get('totalPackets');
+    if (totalPacketsRow && totalPacketsRow.value) {
+      const parsed = Number(totalPacketsRow.value);
+      if (Number.isFinite(parsed) && parsed >= 0) stats.totalPackets = parsed;
+    }
+
+    const positionPacketsRow = stmtMetaGet.get('positionPackets');
+    if (positionPacketsRow && positionPacketsRow.value) {
+      const parsed = Number(positionPacketsRow.value);
+      if (Number.isFinite(parsed) && parsed >= 0) stats.positionPackets = parsed;
+    }
+
+    // Prune inactive nodes on startup so they don't show on the map or linger in the DB.
+    const cutoff = Date.now() - NODE_UNACTIVE_MS;
+    stmtDeleteInactive.run(cutoff);
+
+    const nodeRows = db.prepare('SELECT json FROM nodes').all();
+    nodes.clear();
+    stats.nodesWithPosition = 0;
+    for (const r of nodeRows) {
+      try {
+        const n = JSON.parse(r.json);
+        if (!n || !n.id) continue;
+        if (!isNodeActive(n)) continue;
+        nodes.set(n.id, n);
+        if (n.position) stats.nodesWithPosition++;
+      } catch {}
+    }
+
+    history.length = 0;
+    const histRows = db.prepare('SELECT t, n, p FROM history ORDER BY t ASC').all();
+    for (const hr of histRows) {
+      history.push({ t: hr.t, n: hr.n, p: hr.p });
+    }
+
+    console.log(`DB loaded: ${nodes.size} nodes (${stats.nodesWithPosition} w/pos), ${history.length} history points from ${DB_PATH}`);
+  } catch (err) {
+    console.error('DB init/load failed:', err.message);
+    db = null;
+  }
+}
+
+function markNodeDirty(nodeId) {
+  if (!db) return;
+  dirtyNodeIds.add(nodeId);
+}
+
+function isNodeActive(node, now = Date.now()) {
+  return !!(node && node.lastHeard && (now - node.lastHeard) <= NODE_UNACTIVE_MS);
+}
+
+function flushDb() {
+  if (!db) return;
+  if (dirtyNodeIds.size === 0 && !dirtyStats && pendingHistory.length === 0) return;
+
+  try {
+    db.exec('BEGIN');
+
+    for (const id of dirtyNodeIds) {
+      const n = nodes.get(id);
+      if (!n || !n.position) {
+        stmtNodeDelete.run(id);
+      } else {
+        stmtNodeUpsert.run(id, n.lastHeard || Date.now(), JSON.stringify(serializeNode(n)));
+      }
+    }
+    dirtyNodeIds.clear();
+
+    if (dirtyStats) {
+      stmtMetaSet.run('totalPackets', String(stats.totalPackets));
+      stmtMetaSet.run('positionPackets', String(stats.positionPackets));
+      stmtMetaSet.run('nodesWithPosition', String(stats.nodesWithPosition));
+      dirtyStats = false;
+    }
+
+    for (const hp of pendingHistory) {
+      stmtHistoryUpsert.run(hp.t, hp.n, hp.p);
+    }
+    pendingHistory = [];
+
+    const count = stmtNodeCount.get().c;
+    if (count > DB_MAX_NODES) {
+      stmtNodePrune.run(count - DB_MAX_NODES);
+    }
+
+    db.exec('COMMIT');
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch {}
+    console.error('DB flush failed:', err.message);
+  }
+}
 
 function safeNumber(n, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function loadCacheFromDisk() {
-  if (!CACHE_ENABLED) return;
-  try {
-    if (!fs.existsSync(CACHE_PATH)) return;
-    const raw = fs.readFileSync(CACHE_PATH, 'utf8');
-    if (!raw) return;
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.nodes)) return;
-
-    nodes.clear();
-    stats.nodesWithPosition = 0;
-
-    for (const n of parsed.nodes) {
-      if (!n || !n.id) continue;
-      const node = {
-        id: String(n.id),
-        num: safeNumber(n.num, 0),
-        lastHeard: safeNumber(n.lastHeard, 0),
-        position: n.position || null,
-        user: n.user || null,
-        telemetry: n.telemetry || null,
-        snr: safeNumber(n.snr, 0),
-        rssi: safeNumber(n.rssi, 0),
-        mapReport: n.mapReport || null,
-        neighbors: Array.isArray(n.neighbors) ? n.neighbors : [],
-      };
-      nodes.set(node.id, node);
-      if (node.position) stats.nodesWithPosition++;
-    }
-
-    console.log(`💾 Loaded cache: ${nodes.size} nodes (${stats.nodesWithPosition} with position) from ${CACHE_PATH}`);
-  } catch (err) {
-    console.error('💾 Cache load failed:', err.message);
-  }
-}
-
-function writeCacheToDisk() {
-  if (!CACHE_ENABLED || !cacheDirty) return;
-  cacheDirty = false;
-
-  try {
-    const list = [...nodes.values()]
-      .filter(n => n.position)
-      .sort((a, b) => (b.lastHeard || 0) - (a.lastHeard || 0))
-      .slice(0, CACHE_MAX_NODES)
-      .map(serializeNode);
-
-    const tmp = `${CACHE_PATH}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ t: Date.now(), nodes: list }), 'utf8');
-    fs.renameSync(tmp, CACHE_PATH);
-  } catch (err) {
-    console.error('💾 Cache save failed:', err.message);
-  }
-}
+// Legacy JSON cache (removed). Kept as no-op for backwards compatibility if older code calls it.
+function loadCacheFromDisk() {}
+function writeCacheToDisk() {}
 
 function recordHistory() {
-  history.push({
-    t: Date.now(),
-    n: stats.nodesWithPosition,
-    p: stats.totalPackets,
-  });
+  const point = { t: Date.now(), n: stats.nodesWithPosition, p: stats.totalPackets };
+  history.push(point);
+  if (db) pendingHistory.push(point);
 }
 
 // ─── Broadcast Throttle ─────────────────────────────────────────────────────
@@ -151,7 +251,7 @@ const BROADCAST_INTERVAL = 500;
 let openClientCount = 0;
 
 function queueUpdate(update) {
-  const nodeId = update && update.node && update.node.id;
+  const nodeId = update && ((update.node && update.node.id) || update.id);
   if (nodeId) {
     pendingUpdates.set(nodeId, update);
   } else {
@@ -253,13 +353,49 @@ function processPosition(pos, nodeId) {
   return { lat, lon, altitude: pos.altitude || 0, time: pos.time || 0, satsInView: pos.satsInView || 0 };
 }
 
+function distanceMeters(aLat, aLon, bLat, bLon) {
+  const toRad = (x) => x * Math.PI / 180;
+  const R = 6371000;
+  const dLat = toRad(bLat - aLat);
+  const dLon = toRad(bLon - aLon);
+  const lat1 = toRad(aLat);
+  const lat2 = toRad(bLat);
+  const s1 = Math.sin(dLat / 2);
+  const s2 = Math.sin(dLon / 2);
+  const h = s1 * s1 + Math.cos(lat1) * Math.cos(lat2) * s2 * s2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function shouldAcceptPosition(node, nextPosition) {
+  if (!nextPosition) return false;
+  if (!node.position) return true;
+
+  const now = Date.now();
+  const lastAt = node._posAcceptedAt || 0;
+  const dt = lastAt ? (now - lastAt) : 0;
+  const meters = distanceMeters(node.position.lat, node.position.lon, nextPosition.lat, nextPosition.lon);
+
+  // Reject obvious outliers that create "teleporting" pins on the map.
+  // Allow large moves when the time gap is big (node actually traveled).
+  if (dt > 0) {
+    const speed = meters / (dt / 1000); // m/s
+    const isTeleport = meters > 2000 && speed > 200; // >2km at >720km/h
+    if (isTeleport) return false;
+  }
+
+  return true;
+}
+
 function applyPosition(node, position) {
   if (!position) return false;
+  if (!shouldAcceptPosition(node, position)) return false;
   const hadPosition = !!node.position;
   node.position = position;
+  node._posAcceptedAt = Date.now();
   stats.positionPackets++;
   if (!hadPosition) stats.nodesWithPosition++;
-  cacheDirty = true;
+  markNodeDirty(node.id);
+  dirtyStats = true;
   return true;
 }
 
@@ -267,6 +403,7 @@ function processPacket(envelope) {
   const packet = envelope.packet;
   if (!packet) return;
   stats.totalPackets++;
+  dirtyStats = true;
 
   const fromId = packet.from;
   const nodeHex = nodeIdToHex(fromId);
@@ -332,7 +469,7 @@ function processPacket(envelope) {
           hwModel: userInfo.hwModel || 0,
           role: userInfo.role || 0,
         };
-        cacheDirty = true;
+        markNodeDirty(node.id);
         update = { type: 'nodeinfo', node: serializeNode(node) };
       } catch (e) {}
       break;
@@ -348,7 +485,7 @@ function processPacket(envelope) {
             airUtilTx: telemetry.deviceMetrics.airUtilTx || 0,
             uptimeSeconds: telemetry.deviceMetrics.uptimeSeconds || 0,
           };
-          cacheDirty = true;
+          markNodeDirty(node.id);
           update = { type: 'telemetry', node: serializeNode(node) };
         }
       } catch (e) {}
@@ -375,7 +512,7 @@ function processPacket(envelope) {
           modemPreset: mapReport.modemPreset || 0,
           numOnlineLocalNodes: mapReport.numOnlineLocalNodes || 0,
         };
-        cacheDirty = true;
+        markNodeDirty(node.id);
         update = { type: 'mapreport', node: serializeNode(node) };
       } catch (e) {}
       break;
@@ -387,7 +524,7 @@ function processPacket(envelope) {
           nodeId: nodeIdToHex(n.nodeId),
           snr: n.snr || 0,
         }));
-        cacheDirty = true;
+        markNodeDirty(node.id);
         update = { type: 'neighborinfo', node: serializeNode(node) };
       } catch (e) {}
       break;
@@ -449,7 +586,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/api/nodes', (req, res) => {
   const allNodes = [...nodes.values()]
-    .filter(n => n.position)
+    .filter(n => n.position && isNodeActive(n))
     .map(serializeNode);
   res.json({ nodes: allNodes, stats });
 });
@@ -465,7 +602,7 @@ app.get('/api/history', (req, res) => {
 // ─── Bootstrap ───────────────────────────────────────────────────────────────
 async function main() {
   await loadProtos();
-  loadCacheFromDisk();
+  initDbAndLoad();
 
   const server = http.createServer(app);
 
@@ -475,7 +612,7 @@ async function main() {
     console.log('🌐 New WebSocket client connected');
     openClientCount++;
     // Send compact initial payload with history
-    const allNodes = [...nodes.values()].filter(n => n.position).map(serializeNodeCompact);
+    const allNodes = [...nodes.values()].filter(n => n.position && isNodeActive(n)).map(serializeNodeCompact);
     ws.send(JSON.stringify({
       type: 'init',
       nodes: allNodes,
@@ -546,9 +683,9 @@ async function main() {
   // Record first point immediately
   recordHistory();
 
-  // Periodic cache save
-  if (CACHE_ENABLED) {
-    setInterval(writeCacheToDisk, CACHE_SAVE_INTERVAL_MS);
+  // Periodic DB flush
+  if (db) {
+    setInterval(flushDb, DB_FLUSH_INTERVAL_MS);
   }
 
   // Periodic stats logging
@@ -556,14 +693,16 @@ async function main() {
     console.log(`📊 Nodes: ${nodes.size} | With Position: ${stats.nodesWithPosition} | Total Packets: ${stats.totalPackets} | History Points: ${history.length}`);
   }, 30000);
 
-  // Periodic cleanup of stale nodes (older than 24 hours)
+  // Periodic cleanup of stale nodes
   setInterval(() => {
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - NODE_UNACTIVE_MS;
     for (const [key, node] of nodes) {
       if (node.lastHeard < cutoff) {
         if (node.position) stats.nodesWithPosition--;
+        queueUpdate({ type: 'remove', id: key });
         nodes.delete(key);
-        cacheDirty = true;
+        markNodeDirty(key);
+        dirtyStats = true;
       }
     }
   }, 60 * 60 * 1000);
@@ -575,6 +714,6 @@ main().catch(err => {
 });
 
 process.on('SIGINT', () => {
-  try { writeCacheToDisk(); } catch {}
+  try { flushDb(); } catch {}
   process.exit(0);
 });

@@ -1145,9 +1145,15 @@ html, body {
   line-height: 1;
 }
 
-.leaflet-cluster-anim .leaflet-marker-icon,
-.leaflet-cluster-anim .leaflet-marker-shadow {
+/* Only animate cluster icons; animating all markers can look like "pins jumping" while zooming */
+.leaflet-cluster-anim .leaflet-marker-icon.mesh-cluster {
   transition: transform 0.3s ease-out, opacity 0.3s ease-out;
+}
+
+/* Keep individual pins stable during zoom animations */
+.leaflet-zoom-anim .leaflet-marker-icon.mesh-marker,
+.leaflet-zoom-anim .leaflet-marker-icon.my-location-marker {
+  transition: none !important;
 }
 
 /* ─── Node List Truncation Notice ──────────────────────────────────────── */
