@@ -684,6 +684,37 @@
     state.ws.onerror = () => state.ws.close();
   }
 
+  // ─── Periodic HTTP Polling (every 10 minutes) ──────────────────────────────
+  // Guarantees data freshness even if WebSocket refresh messages are missed.
+  function startPolling() {
+    setInterval(async () => {
+      try {
+        const res = await fetch('/api/nodes');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!data.nodes) return;
+
+        // Build set of active node IDs from server
+        const serverIds = new Set();
+        data.nodes.forEach(n => {
+          serverIds.add(n.id);
+          upsertNode(n);
+        });
+
+        // Remove nodes no longer on the server
+        for (const id of state.nodes.keys()) {
+          if (!serverIds.has(id)) removeNode(id);
+        }
+
+        if (data.stats) updateStats(data.stats);
+        appendLiveHistory();
+        console.log(`🔄 HTTP poll: ${data.nodes.length} nodes refreshed`);
+      } catch (err) {
+        console.warn('HTTP poll failed:', err.message);
+      }
+    }, 10 * 60 * 1000); // every 10 minutes
+  }
+
   function removeNode(nodeId) {
     const id = String(nodeId);
     state.nodes.delete(id);
@@ -856,6 +887,7 @@
     initCharts();
     initUI();
     connectWebSocket();
+    startPolling();
   }
 
   if (document.readyState === 'loading') {
