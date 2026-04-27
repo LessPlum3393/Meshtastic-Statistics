@@ -114,17 +114,49 @@
       center: [20, 0],
       zoom: 3,
       minZoom: 2,
-      maxZoom: 18,
+      maxZoom: 19,
       zoomControl: true,
       attributionControl: true,
       preferCanvas: true,
     });
 
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a> | Meshtastic',
+    // Basemaps
+    const osmUrl = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+
+    // OpenStreetMap Standard (Dark) - CSS-filtered tiles to keep "Standard" styling but dark.
+    const osmStandardDark = L.tileLayer(osmUrl, {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      subdomains: 'abc',
+      maxZoom: 19,
+      detectRetina: true,
+      className: 'osm-tiles osm-tiles-dark',
+    }).addTo(state.map);
+
+    const osmStandardLight = L.tileLayer(osmUrl, {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      subdomains: 'abc',
+      maxZoom: 19,
+      detectRetina: true,
+      className: 'osm-tiles',
+    });
+
+    const cartoDark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>',
       subdomains: 'abcd',
       maxZoom: 19,
-    }).addTo(state.map);
+      detectRetina: true,
+    });
+
+    L.control.layers(
+      { 'OpenStreetMap (Dark)': osmStandardDark, 'OpenStreetMap (Light)': osmStandardLight, 'CARTO Dark': cartoDark },
+      undefined,
+      { position: 'topright' }
+    ).addTo(state.map);
+
+    state.map.attributionControl.setPrefix(false);
+    state.map.attributionControl.addAttribution('Meshtastic');
+
+    L.control.scale({ imperial: false }).addTo(state.map);
 
     state.clusterGroup = L.markerClusterGroup({
       maxClusterRadius: 50,
@@ -169,6 +201,7 @@
       iconAnchor: [7, 7],
     });
     const marker = L.marker([node.position.lat, node.position.lon], { icon });
+    marker._meshRoleClass = roleClass;
     marker.on('click', () => showNodePopup(node, marker));
     return marker;
   }
@@ -176,6 +209,8 @@
   function showNodePopup(node, marker) {
     // Use fresh node data from state
     const n = state.nodes.get(node.id) || node;
+    state.selectedNodeId = n.id;
+    scheduleNodeListUpdate();
     const name = (n.user && n.user.longName) || n.id;
     const shortName = (n.user && n.user.shortName) || '??';
     const role = ROLE_LABELS[(n.user && n.user.role) || 0] || 'Unknown';
@@ -210,11 +245,14 @@
         const m = state.markers.get(node.id);
         m.setLatLng([node.position.lat, node.position.lon]);
         const rc = ROLE_CLASSES[(node.user && node.user.role) || 0] || '';
-        m.setIcon(L.divIcon({
-          className: 'mesh-marker',
-          html: `<div class="marker-pulse"></div><div class="marker-dot ${rc}"></div>`,
-          iconSize: [14, 14], iconAnchor: [7, 7],
-        }));
+        if (m._meshRoleClass !== rc) {
+          m._meshRoleClass = rc;
+          m.setIcon(L.divIcon({
+            className: 'mesh-marker',
+            html: `<div class="marker-pulse"></div><div class="marker-dot ${rc}"></div>`,
+            iconSize: [14, 14], iconAnchor: [7, 7],
+          }));
+        }
       } else {
         const m = createMarker(node);
         if (m) { state.markers.set(node.id, m); state.clusterGroup.addLayer(m); }
@@ -316,8 +354,8 @@
 
   // ─── Stats Update ─────────────────────────────────────────────────────────
   function updateStats(s) {
-    const n = [...state.nodes.values()].filter(n => n.position).length;
-    document.querySelector('#statNodes span').textContent = `${n} nodes`;
+    const n = (s && Number.isFinite(s.nodesWithPosition)) ? s.nodesWithPosition : [...state.nodes.values()].filter(n => n.position).length;
+    document.querySelector('#statNodes span').textContent = `${formatNumber(n)} nodes`;
     if (s) {
       state.lastStats = s;
       document.querySelector('#statPackets span').textContent = `${formatNumber(s.totalPackets)} packets`;
@@ -326,7 +364,7 @@
 
   // ─── Append live history point ────────────────────────────────────────────
   function appendLiveHistory() {
-    const n = [...state.nodes.values()].filter(n => n.position).length;
+    const n = (state.lastStats && Number.isFinite(state.lastStats.nodesWithPosition)) ? state.lastStats.nodesWithPosition : [...state.nodes.values()].filter(n => n.position).length;
     const p = (state.lastStats && state.lastStats.totalPackets) || 0;
     state.history.push({ t: Date.now(), n, p });
     scheduleChartUpdate();
@@ -358,13 +396,15 @@
     const ctx1 = document.getElementById('activeNodesChart').getContext('2d');
     state.charts.activeNodes = new Chart(ctx1, {
       type: 'line',
-      data: { labels: [], datasets: [{
-        label: 'Active Nodes', data: [],
-        borderColor: '#06b6d4', backgroundColor: makeGradient(ctx1, '#06b6d4'),
-        fill: true, tension: 0.4, borderWidth: 2,
-        pointRadius: 0, pointHoverRadius: 5,
-        pointHoverBackgroundColor: '#06b6d4', pointHoverBorderColor: '#fff', pointHoverBorderWidth: 2,
-      }]},
+      data: {
+        labels: [], datasets: [{
+          label: 'Active Nodes', data: [],
+          borderColor: '#06b6d4', backgroundColor: makeGradient(ctx1, '#06b6d4'),
+          fill: true, tension: 0.4, borderWidth: 2,
+          pointRadius: 0, pointHoverRadius: 5,
+          pointHoverBackgroundColor: '#06b6d4', pointHoverBorderColor: '#fff', pointHoverBorderWidth: 2,
+        }]
+      },
       options: {
         responsive: true, maintainAspectRatio: false,
         interaction: { intersect: false, mode: 'index' },
@@ -380,13 +420,15 @@
     const ctx2 = document.getElementById('packetsChart').getContext('2d');
     state.charts.packets = new Chart(ctx2, {
       type: 'line',
-      data: { labels: [], datasets: [{
-        label: 'Total Packets', data: [],
-        borderColor: '#8b5cf6', backgroundColor: makeGradient(ctx2, '#8b5cf6'),
-        fill: true, tension: 0.4, borderWidth: 2,
-        pointRadius: 0, pointHoverRadius: 5,
-        pointHoverBackgroundColor: '#8b5cf6', pointHoverBorderColor: '#fff', pointHoverBorderWidth: 2,
-      }]},
+      data: {
+        labels: [], datasets: [{
+          label: 'Total Packets', data: [],
+          borderColor: '#8b5cf6', backgroundColor: makeGradient(ctx2, '#8b5cf6'),
+          fill: true, tension: 0.4, borderWidth: 2,
+          pointRadius: 0, pointHoverRadius: 5,
+          pointHoverBackgroundColor: '#8b5cf6', pointHoverBorderColor: '#fff', pointHoverBorderWidth: 2,
+        }]
+      },
       options: {
         responsive: true, maintainAspectRatio: false,
         interaction: { intersect: false, mode: 'index' },
@@ -661,6 +703,15 @@
 
     document.getElementById('mobileSidebarBtn').addEventListener('click', () => {
       document.getElementById('sidebar').classList.toggle('mobile-open');
+    });
+
+    // Keep Leaflet sized correctly when the viewport changes.
+    let resizeTimer = null;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (state.activeTab === 'map' && state.map) state.map.invalidateSize();
+      }, 150);
     });
 
     // Geolocation button

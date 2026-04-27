@@ -519,6 +519,41 @@ html, body {
   color: var(--accent-cyan) !important;
 }
 
+/* OpenStreetMap Standard dark mode (tile CSS filter) */
+.osm-tiles-dark {
+  filter: invert(1) hue-rotate(180deg) brightness(0.9) contrast(1.05);
+}
+
+.osm-tiles-dark.leaflet-tile-loaded {
+  image-rendering: auto;
+}
+
+.leaflet-control-layers {
+  border: 1px solid var(--border-color) !important;
+  border-radius: var(--radius-md) !important;
+  box-shadow: var(--shadow-lg) !important;
+  background: var(--bg-card) !important;
+  backdrop-filter: blur(10px);
+  color: var(--text-primary) !important;
+}
+
+.leaflet-control-layers-toggle {
+  background-color: transparent !important;
+}
+
+.leaflet-control-layers-expanded {
+  padding: 10px 10px 8px 10px !important;
+}
+
+.leaflet-control-layers label {
+  color: var(--text-primary) !important;
+  font-size: 12px !important;
+}
+
+.leaflet-control-layers-separator {
+  border-top: 1px solid var(--border-color) !important;
+}
+
 /* ─── Custom Markers ───────────────────────────────────────────────────── */
 .mesh-marker {
   position: relative;

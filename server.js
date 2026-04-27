@@ -5,26 +5,46 @@ const protobuf = require('protobufjs');
 const crypto = require('crypto');
 const WebSocket = require('ws');
 const path = require('path');
+const fs = require('fs');
+
+function parseBoolEnv(name, defaultValue) {
+  const raw = process.env[name];
+  if (raw == null) return defaultValue;
+  const v = String(raw).trim().toLowerCase();
+  if (v === '1' || v === 'true' || v === 'yes' || v === 'y' || v === 'on') return true;
+  if (v === '0' || v === 'false' || v === 'no' || v === 'n' || v === 'off') return false;
+  return defaultValue;
+}
+
+function getMqttTopics() {
+  if (process.env.MESHTASTIC_TOPICS) {
+    return String(process.env.MESHTASTIC_TOPICS)
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+  }
+
+  // Retained map reports are the fastest path to a large node list.
+  const topics = ['msh/+/2/map/#'];
+
+  if (parseBoolEnv('MESHTASTIC_INCLUDE_ALL_CHANNELS', false)) {
+    // Highest-traffic option; will discover nodes across all presets/channels.
+    topics.push('msh/+/2/e/#');
+  } else {
+    // LongFast is high traffic; disable by default for fastest catch-up.
+    if (parseBoolEnv('MESHTASTIC_INCLUDE_LONGFAST', false)) {
+      topics.push('msh/+/2/e/LongFast/#');
+    }
+  }
+  return topics;
+}
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 const CONFIG = {
   port: process.env.PORT || 3000,
   mqtt: {
     broker: 'mqtt://mqtt.meshtastic.org:1883',
-    topics: [
-      'msh/US/2/e/LongFast/#',
-      'msh/EU_868/2/e/LongFast/#',
-      'msh/IN/2/e/LongFast/#',
-      'msh/ANZ/2/e/LongFast/#',
-      'msh/KR/2/e/LongFast/#',
-      'msh/TW/2/e/LongFast/#',
-      'msh/RU/2/e/LongFast/#',
-      'msh/JP/2/e/LongFast/#',
-      'msh/CN/2/e/LongFast/#',
-      'msh/EU_433/2/e/LongFast/#',
-      'msh/US/2/map/#',
-      'msh/EU_868/2/map/#',
-    ],
+    topics: getMqttTopics(),
     options: {
       clientId: `meshtastic-map-${Math.random().toString(16).slice(2, 10)}`,
       clean: true,
@@ -48,22 +68,95 @@ const SERVER_STARTED_AT = Date.now();
 const history = []; // { t: timestamp, n: nodeCount, p: totalPackets }
 const HISTORY_INTERVAL = 10000; // 10s
 
+// ─── Persistence (optional) ──────────────────────────────────────────────────
+const CACHE_ENABLED = parseBoolEnv('MESHTASTIC_CACHE_ENABLED', true);
+const CACHE_PATH = process.env.MESHTASTIC_CACHE_PATH
+  ? path.resolve(process.env.MESHTASTIC_CACHE_PATH)
+  : path.join(__dirname, 'nodes-cache.json');
+const CACHE_SAVE_INTERVAL_MS = Number(process.env.MESHTASTIC_CACHE_SAVE_INTERVAL_MS || 60000);
+const CACHE_MAX_NODES = Number(process.env.MESHTASTIC_CACHE_MAX_NODES || 25000);
+let cacheDirty = false;
+
+function safeNumber(n, fallback = 0) {
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function loadCacheFromDisk() {
+  if (!CACHE_ENABLED) return;
+  try {
+    if (!fs.existsSync(CACHE_PATH)) return;
+    const raw = fs.readFileSync(CACHE_PATH, 'utf8');
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.nodes)) return;
+
+    nodes.clear();
+    stats.nodesWithPosition = 0;
+
+    for (const n of parsed.nodes) {
+      if (!n || !n.id) continue;
+      const node = {
+        id: String(n.id),
+        num: safeNumber(n.num, 0),
+        lastHeard: safeNumber(n.lastHeard, 0),
+        position: n.position || null,
+        user: n.user || null,
+        telemetry: n.telemetry || null,
+        snr: safeNumber(n.snr, 0),
+        rssi: safeNumber(n.rssi, 0),
+        mapReport: n.mapReport || null,
+        neighbors: Array.isArray(n.neighbors) ? n.neighbors : [],
+      };
+      nodes.set(node.id, node);
+      if (node.position) stats.nodesWithPosition++;
+    }
+
+    console.log(`💾 Loaded cache: ${nodes.size} nodes (${stats.nodesWithPosition} with position) from ${CACHE_PATH}`);
+  } catch (err) {
+    console.error('💾 Cache load failed:', err.message);
+  }
+}
+
+function writeCacheToDisk() {
+  if (!CACHE_ENABLED || !cacheDirty) return;
+  cacheDirty = false;
+
+  try {
+    const list = [...nodes.values()]
+      .filter(n => n.position)
+      .sort((a, b) => (b.lastHeard || 0) - (a.lastHeard || 0))
+      .slice(0, CACHE_MAX_NODES)
+      .map(serializeNode);
+
+    const tmp = `${CACHE_PATH}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ t: Date.now(), nodes: list }), 'utf8');
+    fs.renameSync(tmp, CACHE_PATH);
+  } catch (err) {
+    console.error('💾 Cache save failed:', err.message);
+  }
+}
+
 function recordHistory() {
-  const count = [...nodes.values()].filter(n => n.position).length;
   history.push({
     t: Date.now(),
-    n: count,
+    n: stats.nodesWithPosition,
     p: stats.totalPackets,
   });
 }
 
 // ─── Broadcast Throttle ─────────────────────────────────────────────────────
-let pendingUpdates = [];
+let pendingUpdates = new Map();
 let broadcastTimer = null;
 const BROADCAST_INTERVAL = 500;
+let openClientCount = 0;
 
 function queueUpdate(update) {
-  pendingUpdates.push(update);
+  const nodeId = update && update.node && update.node.id;
+  if (nodeId) {
+    pendingUpdates.set(nodeId, update);
+  } else {
+    pendingUpdates.set(`_u_${pendingUpdates.size}`, update);
+  }
   if (!broadcastTimer) {
     broadcastTimer = setTimeout(flushUpdates, BROADCAST_INTERVAL);
   }
@@ -71,13 +164,18 @@ function queueUpdate(update) {
 
 function flushUpdates() {
   broadcastTimer = null;
-  if (pendingUpdates.length === 0) return;
-  if (pendingUpdates.length === 1) {
-    broadcastToClients(pendingUpdates[0]);
-  } else {
-    broadcastToClients({ type: 'batch', updates: pendingUpdates, stats });
+  if (pendingUpdates.size === 0) return;
+  if (openClientCount === 0) {
+    pendingUpdates.clear();
+    return;
   }
-  pendingUpdates = [];
+  const updates = Array.from(pendingUpdates.values());
+  if (updates.length === 1) {
+    broadcastToClients(updates[0]);
+  } else {
+    broadcastToClients({ type: 'batch', updates, stats });
+  }
+  pendingUpdates.clear();
 }
 
 // ─── Protobuf Setup ─────────────────────────────────────────────────────────
@@ -107,28 +205,34 @@ async function loadProtos() {
 }
 
 // ─── Decryption ──────────────────────────────────────────────────────────────
-function decrypt(encryptedBytes, packetId, fromId, key) {
+function normalizeAes256Key(keyBuf) {
+  let k = Buffer.isBuffer(keyBuf) ? keyBuf : Buffer.from(keyBuf || '');
+
+  if (k.length === 1) {
+    const expanded = Buffer.alloc(16, k[0]);
+    k = Buffer.concat([expanded, expanded]);
+  } else if (k.length === 16) {
+    k = Buffer.concat([k, k]);
+  }
+
+  if (k.length < 32) {
+    const padded = Buffer.alloc(32);
+    k.copy(padded);
+    k = padded;
+  }
+
+  return k.slice(0, 32);
+}
+
+const DEFAULT_AES_KEY_32 = normalizeAes256Key(CONFIG.defaultKey);
+
+function decrypt(encryptedBytes, packetId, fromId, key32) {
   try {
     const nonce = Buffer.alloc(16);
     nonce.writeUInt32LE(packetId, 0);
     nonce.writeUInt32LE(fromId, 4);
 
-    let keyBuf = key;
-    if (keyBuf.length === 16) {
-      keyBuf = Buffer.concat([keyBuf, keyBuf]);
-    } else if (keyBuf.length === 1) {
-      const expanded = Buffer.alloc(16);
-      expanded[0] = keyBuf[0];
-      keyBuf = Buffer.concat([expanded, expanded]);
-    }
-
-    if (keyBuf.length < 32) {
-      const padded = Buffer.alloc(32);
-      keyBuf.copy(padded);
-      keyBuf = padded;
-    }
-
-    const decipher = crypto.createDecipheriv('aes-256-ctr', keyBuf.slice(0, 32), nonce);
+    const decipher = crypto.createDecipheriv('aes-256-ctr', key32, nonce);
     return Buffer.concat([decipher.update(encryptedBytes), decipher.final()]);
   } catch (err) {
     return null;
@@ -149,6 +253,16 @@ function processPosition(pos, nodeId) {
   return { lat, lon, altitude: pos.altitude || 0, time: pos.time || 0, satsInView: pos.satsInView || 0 };
 }
 
+function applyPosition(node, position) {
+  if (!position) return false;
+  const hadPosition = !!node.position;
+  node.position = position;
+  stats.positionPackets++;
+  if (!hadPosition) stats.nodesWithPosition++;
+  cacheDirty = true;
+  return true;
+}
+
 function processPacket(envelope) {
   const packet = envelope.packet;
   if (!packet) return;
@@ -162,7 +276,7 @@ function processPacket(envelope) {
   if (packet.decoded) {
     data = packet.decoded;
   } else if (packet.encrypted && packet.encrypted.length > 0) {
-    const decrypted = decrypt(packet.encrypted, packet.id, packet.from, CONFIG.defaultKey);
+    const decrypted = decrypt(packet.encrypted, packet.id, packet.from, DEFAULT_AES_KEY_32);
     if (decrypted) {
       try {
         data = Data.decode(decrypted);
@@ -202,9 +316,7 @@ function processPacket(envelope) {
       try {
         const pos = Position.decode(data.payload);
         const processed = processPosition(pos, nodeHex);
-        if (processed) {
-          node.position = processed;
-          stats.positionPackets++;
+        if (applyPosition(node, processed)) {
           update = { type: 'position', node: serializeNode(node) };
         }
       } catch (e) {}
@@ -220,6 +332,7 @@ function processPacket(envelope) {
           hwModel: userInfo.hwModel || 0,
           role: userInfo.role || 0,
         };
+        cacheDirty = true;
         update = { type: 'nodeinfo', node: serializeNode(node) };
       } catch (e) {}
       break;
@@ -235,6 +348,7 @@ function processPacket(envelope) {
             airUtilTx: telemetry.deviceMetrics.airUtilTx || 0,
             uptimeSeconds: telemetry.deviceMetrics.uptimeSeconds || 0,
           };
+          cacheDirty = true;
           update = { type: 'telemetry', node: serializeNode(node) };
         }
       } catch (e) {}
@@ -247,8 +361,7 @@ function processPacket(envelope) {
           const lat = mapReport.latitudeI / 1e7;
           const lon = mapReport.longitudeI / 1e7;
           if (Math.abs(lat) <= 90 && Math.abs(lon) <= 180 && !(lat === 0 && lon === 0)) {
-            node.position = { lat, lon, altitude: mapReport.altitude || 0, time: 0, satsInView: 0 };
-            stats.positionPackets++;
+            applyPosition(node, { lat, lon, altitude: mapReport.altitude || 0, time: 0, satsInView: 0 });
           }
         }
         node.user = node.user || {};
@@ -262,6 +375,7 @@ function processPacket(envelope) {
           modemPreset: mapReport.modemPreset || 0,
           numOnlineLocalNodes: mapReport.numOnlineLocalNodes || 0,
         };
+        cacheDirty = true;
         update = { type: 'mapreport', node: serializeNode(node) };
       } catch (e) {}
       break;
@@ -273,12 +387,11 @@ function processPacket(envelope) {
           nodeId: nodeIdToHex(n.nodeId),
           snr: n.snr || 0,
         }));
+        cacheDirty = true;
         update = { type: 'neighborinfo', node: serializeNode(node) };
       } catch (e) {}
       break;
   }
-
-  stats.nodesWithPosition = [...nodes.values()].filter(n => n.position).length;
 
   if (update) {
     queueUpdate(update);
@@ -321,7 +434,7 @@ function serializeNodeCompact(node) {
 let wss;
 
 function broadcastToClients(data) {
-  if (!wss) return;
+  if (!wss || openClientCount === 0) return;
   const msg = JSON.stringify(data);
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
@@ -352,6 +465,7 @@ app.get('/api/history', (req, res) => {
 // ─── Bootstrap ───────────────────────────────────────────────────────────────
 async function main() {
   await loadProtos();
+  loadCacheFromDisk();
 
   const server = http.createServer(app);
 
@@ -359,6 +473,7 @@ async function main() {
   wss = new WebSocket.Server({ server });
   wss.on('connection', (ws) => {
     console.log('🌐 New WebSocket client connected');
+    openClientCount++;
     // Send compact initial payload with history
     const allNodes = [...nodes.values()].filter(n => n.position).map(serializeNodeCompact);
     ws.send(JSON.stringify({
@@ -371,11 +486,13 @@ async function main() {
 
     ws.on('close', () => {
       console.log('🌐 WebSocket client disconnected');
+      openClientCount = Math.max(0, openClientCount - 1);
     });
   });
 
   // MQTT connection
   console.log(`🔌 Connecting to MQTT broker: ${CONFIG.mqtt.broker}`);
+  console.log(`📡 MQTT topics: ${CONFIG.mqtt.topics.join(', ')}`);
   const mqttClient = mqtt.connect(CONFIG.mqtt.broker, CONFIG.mqtt.options);
 
   mqttClient.on('connect', () => {
@@ -392,10 +509,13 @@ async function main() {
   });
 
   let msgCount = 0;
+  let lastLogAt = 0;
   mqttClient.on('message', (topic, message) => {
     msgCount++;
-    if (msgCount <= 5 || msgCount % 100 === 0) {
-      console.log(`📨 MQTT msg #${msgCount} topic=${topic} len=${message.length}`);
+    const now = Date.now();
+    if (msgCount <= 5 || now - lastLogAt >= 15000) {
+      lastLogAt = now;
+      console.log(`📨 MQTT msgs=${msgCount} topic=${topic} len=${message.length}`);
     }
     try {
       const envelope = ServiceEnvelope.decode(message);
@@ -426,6 +546,11 @@ async function main() {
   // Record first point immediately
   recordHistory();
 
+  // Periodic cache save
+  if (CACHE_ENABLED) {
+    setInterval(writeCacheToDisk, CACHE_SAVE_INTERVAL_MS);
+  }
+
   // Periodic stats logging
   setInterval(() => {
     console.log(`📊 Nodes: ${nodes.size} | With Position: ${stats.nodesWithPosition} | Total Packets: ${stats.totalPackets} | History Points: ${history.length}`);
@@ -436,7 +561,9 @@ async function main() {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     for (const [key, node] of nodes) {
       if (node.lastHeard < cutoff) {
+        if (node.position) stats.nodesWithPosition--;
         nodes.delete(key);
+        cacheDirty = true;
       }
     }
   }, 60 * 60 * 1000);
@@ -445,4 +572,9 @@ async function main() {
 main().catch(err => {
   console.error('Fatal error:', err);
   process.exit(1);
+});
+
+process.on('SIGINT', () => {
+  try { writeCacheToDisk(); } catch {}
+  process.exit(0);
 });
