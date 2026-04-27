@@ -366,13 +366,15 @@
   }
 
   // ─── Debounced Node List ──────────────────────────────────────────────────
+  let _lastNodeListHash = '';
+
   function scheduleNodeListUpdate() {
     state.nodeListDirty = true;
     if (!state.nodeListTimer) {
       state.nodeListTimer = setTimeout(() => {
         state.nodeListTimer = null;
         if (state.nodeListDirty) { state.nodeListDirty = false; updateNodeList(); }
-      }, 500);
+      }, 3000);
     }
   }
 
@@ -386,11 +388,20 @@
     });
 
     if (!filtered.length) {
+      const emptyHash = '_empty_' + term;
+      if (_lastNodeListHash === emptyHash) return;
+      _lastNodeListHash = emptyHash;
       container.innerHTML = `<div class="node-list-empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="32" height="32" opacity="0.4"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg><p>${term ? 'No matching nodes' : 'Waiting for nodes...'}</p><span>${term ? 'Try a different search term' : 'Nodes will appear as data arrives'}</span></div>`;
       return;
     }
 
     const vis = filtered.slice(0, 100);
+
+    // Skip DOM rebuild if the visible node list hasn't changed
+    const newHash = vis.map(n => n.id + ':' + Math.floor(n.lastHeard / 60000)).join(',') + ':' + (state.selectedNodeId || '');
+    if (_lastNodeListHash === newHash) return;
+    _lastNodeListHash = newHash;
+
     const frag = document.createDocumentFragment();
     vis.forEach(n => {
       const d = document.createElement('div');
@@ -404,6 +415,7 @@
           const mk = state.markers.get(n.id);
           if (mk) state.clusterGroup.zoomToShowLayer(mk, () => showNodePopup(n, mk));
         }
+        _lastNodeListHash = ''; // force refresh on click
         updateNodeList();
       });
       frag.appendChild(d);
