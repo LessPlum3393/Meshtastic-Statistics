@@ -627,6 +627,9 @@ function processPacket(envelope) {
             applyPosition(node, { lat, lon, altitude: mapReport.altitude || 0, time: 0, satsInView: 0 });
           }
         }
+        // Map reports are retained MQTT messages — on re-subscription they get re-delivered.
+        // Always use Date.now() so lastHeard refreshes on every re-delivery.
+        node.lastHeard = Date.now();
         node.user = node.user || {};
         node.user.longName = mapReport.longName || node.user.longName || '';
         node.user.shortName = mapReport.shortName || node.user.shortName || '';
@@ -842,21 +845,40 @@ async function main() {
     }
   }, 10 * 60 * 1000);
 
-  // Periodic full-node broadcast to all clients (every 10 minutes)
-  // Ensures connected clients always have fresh data even if no new MQTT packets arrive
+  // Periodic MQTT re-subscription (every 10 minutes)
+  // Map reports are RETAINED messages — the broker only delivers them once on subscribe.
+  // By re-subscribing periodically, we force the broker to re-deliver all retained messages,
+  // which updates node lastHeard timestamps and keeps the data fresh.
   setInterval(() => {
-    if (openClientCount === 0) return;
-    const allNodes = [...nodes.values()]
-      .filter(n => n.position && isNodeActive(n))
-      .map(serializeNode);
-    const payload = JSON.stringify({ type: 'refresh', nodes: allNodes, stats });
-    wss.clients.forEach(client => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(payload);
-      }
+    if (!mqttClient.connected) return;
+    CONFIG.mqtt.topics.forEach(topic => {
+      mqttClient.unsubscribe(topic, () => {
+        mqttClient.subscribe(topic, (err) => {
+          if (!err) {
+            console.log(`🔄 Re-subscribed to ${topic} (retained message refresh)`);
+          }
+        });
+      });
     });
-    console.log(`🔄 Broadcast full refresh to ${openClientCount} client(s): ${allNodes.length} nodes`);
   }, 10 * 60 * 1000);
+
+  // Periodic full-node broadcast to all clients (every 10 minutes, offset by 30s)
+  // Ensures connected clients always have fresh data after MQTT re-subscription
+  setTimeout(() => {
+    setInterval(() => {
+      if (openClientCount === 0) return;
+      const allNodes = [...nodes.values()]
+        .filter(n => n.position && isNodeActive(n))
+        .map(serializeNode);
+      const payload = JSON.stringify({ type: 'refresh', nodes: allNodes, stats });
+      wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(payload);
+        }
+      });
+      console.log(`🔄 Broadcast full refresh to ${openClientCount} client(s): ${allNodes.length} nodes`);
+    }, 10 * 60 * 1000);
+  }, 30000); // offset 30s so retained messages arrive before broadcast
 }
 
 main().catch(err => {

@@ -318,6 +318,11 @@
       }
     }
 
+    // Preserve neighbor data across non-neighborinfo updates
+    if (prev && prev.neighbors && prev.neighbors.length > 0 && (!node.neighbors || node.neighbors.length === 0)) {
+      node.neighbors = prev.neighbors;
+    }
+
     state.nodes.set(node.id, node);
     scheduleNodeListUpdate();
   }
