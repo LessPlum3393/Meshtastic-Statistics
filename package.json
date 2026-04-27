@@ -10,6 +10,7 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "express": "^4.21.0",
+    "mongodb": "^7.2.0",
     "mqtt": "^5.10.0",
     "protobufjs": "^7.4.0",
     "ws": "^8.18.0"
