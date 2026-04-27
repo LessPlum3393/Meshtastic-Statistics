@@ -44,6 +44,7 @@ This application connects to the official public Meshtastic MQTT broker, listens
    - MongoDB URI: If using MongoDB, specify `MONGODB_URI=mongodb://localhost:27017/meshtastic`
    - Default local database file: `meshtastic-data.db` (override with `MESHTASTIC_DB_PATH`)
    - Hide/delete inactive nodes: `NODE_INACTIVE=1440` (minutes, default = 24 hours)
+   - Public API: `API=true` (default). Set `API=false` to disable `/api/*` endpoints.
 
 3. **View the Dashboard**
    Open your browser and navigate to `http://localhost:3000`.

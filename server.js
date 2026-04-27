@@ -90,6 +90,7 @@ const DB_FLUSH_INTERVAL_MS = Number(process.env.MESHTASTIC_DB_FLUSH_INTERVAL_MS 
 const DB_MAX_NODES = Number(process.env.MESHTASTIC_DB_MAX_NODES || 50000);
 const NODE_INACTIVE_MINUTES = parseNumberEnv('NODE_INACTIVE', 24 * 60);
 const NODE_INACTIVE_MS = Math.max(1, NODE_INACTIVE_MINUTES) * 60 * 1000;
+const API_ENABLED = parseBoolEnv('API', true);
 
 let db = null;
 let mongoClient = null;
@@ -709,20 +710,26 @@ function broadcastToClients(data) {
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
 
-app.get('/api/nodes', (req, res) => {
-  const allNodes = [...nodes.values()]
-    .filter(n => n.position && isNodeActive(n))
-    .map(serializeNode);
-  res.json({ nodes: allNodes, stats });
-});
+if (API_ENABLED) {
+  app.get('/api/nodes', (req, res) => {
+    const allNodes = [...nodes.values()]
+      .filter(n => n.position && isNodeActive(n))
+      .map(serializeNode);
+    res.json({ nodes: allNodes, stats });
+  });
 
-app.get('/api/stats', (req, res) => {
-  res.json(stats);
-});
+  app.get('/api/stats', (req, res) => {
+    res.json(stats);
+  });
 
-app.get('/api/history', (req, res) => {
-  res.json({ startedAt: SERVER_STARTED_AT, history });
-});
+  app.get('/api/history', (req, res) => {
+    res.json({ startedAt: SERVER_STARTED_AT, history });
+  });
+} else {
+  app.use('/api', (req, res) => {
+    res.status(403).json({ error: 'API is disabled' });
+  });
+}
 
 // ─── Bootstrap ───────────────────────────────────────────────────────────────
 async function main() {
