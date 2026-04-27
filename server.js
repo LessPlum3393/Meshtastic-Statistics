@@ -690,6 +690,9 @@ function serializeNodeCompact(node) {
   if (node.telemetry && node.telemetry.batteryLevel) o.bat = node.telemetry.batteryLevel;
   if (node.mapReport && node.mapReport.firmwareVersion) o.fw = node.mapReport.firmwareVersion;
   if (node.snr) o.snr = node.snr;
+  if (node.neighbors && node.neighbors.length > 0) {
+    o.nb = node.neighbors.map(n => ({ id: n.nodeId, snr: n.snr || 0 }));
+  }
   return o;
 }
 

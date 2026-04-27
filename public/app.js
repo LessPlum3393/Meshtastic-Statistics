@@ -22,6 +22,8 @@
     chartUpdateTimer: null,
     // Time range selections
     ranges: { nodes: 'lifetime', packets: 'lifetime' },
+    // Connection lines between nodes
+    connectionLines: [],
   };
 
   // ─── Role Labels ───────────────────────────────────────────────────────────
@@ -234,6 +236,9 @@
     const hwModel = HW_MODELS[(n.user && n.user.hwModel) || 0] || 'Unknown';
     const lastSeen = timeAgo(n.lastHeard);
 
+    // Count connections for display
+    const connectionCount = countConnections(n.id);
+
     let h = `<div class="popup-content"><div class="popup-header">
       <div class="popup-avatar">${escHtml(shortName)}</div>
       <div><div class="popup-title">${escHtml(name)}</div>
@@ -247,11 +252,24 @@
     if (n.telemetry && n.telemetry.batteryLevel > 0) h += `<div class="popup-field"><div class="popup-label">Battery</div><div class="popup-value">${n.telemetry.batteryLevel}%</div></div>`;
     if (n.snr) h += `<div class="popup-field"><div class="popup-label">SNR</div><div class="popup-value">${n.snr.toFixed(1)} dB</div></div>`;
     if (n.mapReport && n.mapReport.firmwareVersion) h += `<div class="popup-field"><div class="popup-label">Firmware</div><div class="popup-value">${escHtml(n.mapReport.firmwareVersion)}</div></div>`;
+    if (connectionCount > 0) h += `<div class="popup-field"><div class="popup-label">Connections</div><div class="popup-value">${connectionCount} node${connectionCount !== 1 ? 's' : ''}</div></div>`;
     h += `<div class="popup-field full"><div class="popup-label">Last Seen</div><div class="popup-value">${lastSeen}</div></div></div></div>`;
 
     // Unbind any existing popup first, then rebind — fixes second-click bug
     marker.unbindPopup();
     marker.bindPopup(h, { maxWidth: 320, className: 'mesh-popup' }).openPopup();
+
+    // Draw connection lines to neighbors
+    drawConnectionLines(n.id);
+
+    // Clear lines when popup closes
+    marker.on('popupclose', () => {
+      clearConnectionLines();
+      if (state.selectedNodeId === n.id) {
+        state.selectedNodeId = null;
+        scheduleNodeListUpdate();
+      }
+    });
   }
 
   // ─── Node Upsert ──────────────────────────────────────────────────────────
@@ -306,11 +324,12 @@
 
   // ─── Compact Node Deserialization ─────────────────────────────────────────
   function expandCompactNode(c) {
-    const node = { id: c.id, lastHeard: c.lh, position: null, user: null, telemetry: null, snr: c.snr || 0, rssi: 0, mapReport: null };
+    const node = { id: c.id, lastHeard: c.lh, position: null, user: null, telemetry: null, snr: c.snr || 0, rssi: 0, mapReport: null, neighbors: [] };
     if (c.p) node.position = { lat: c.p[0], lon: c.p[1], altitude: c.p[2] || 0 };
     if (c.u) node.user = { longName: c.u.l || '', shortName: c.u.s || '', hwModel: c.u.h || 0, role: c.u.r || 0 };
     if (c.bat) node.telemetry = { batteryLevel: c.bat };
     if (c.fw) node.mapReport = { firmwareVersion: c.fw };
+    if (c.nb) node.neighbors = c.nb.map(n => ({ nodeId: n.id, snr: n.snr || 0 }));
     return node;
   }
 
@@ -595,7 +614,7 @@
     setText('#chartStatCurrent .chart-stat-value', nodesWithPos);
     setText('#chartStatPeak .chart-stat-value', peak);
 
-    // Uptime
+    // Total time
     if (state.serverStartedAt) {
       const ms = Date.now() - state.serverStartedAt;
       setText('#chartStatUptime .chart-stat-value', formatDuration(ms));
@@ -756,6 +775,92 @@
     if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
     if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
     return String(n);
+  }
+
+  // ─── Connection Lines ──────────────────────────────────────────────────────
+  function getConnectedNodeIds(nodeId) {
+    const connectedIds = new Set();
+    const selected = state.nodes.get(nodeId);
+
+    // Direct neighbors: nodes this node reports as neighbors
+    if (selected && selected.neighbors) {
+      for (const nb of selected.neighbors) {
+        if (nb.nodeId && nb.nodeId !== nodeId) connectedIds.add(nb.nodeId);
+      }
+    }
+
+    // Reverse neighbors: other nodes that list this node in their neighbor list
+    state.nodes.forEach((n) => {
+      if (n.id === nodeId || !n.neighbors) return;
+      for (const nb of n.neighbors) {
+        if (nb.nodeId === nodeId) {
+          connectedIds.add(n.id);
+          break;
+        }
+      }
+    });
+
+    return connectedIds;
+  }
+
+  function countConnections(nodeId) {
+    return getConnectedNodeIds(nodeId).size;
+  }
+
+  function drawConnectionLines(nodeId) {
+    clearConnectionLines();
+    const selected = state.nodes.get(nodeId);
+    if (!selected || !selected.position) return;
+
+    const connectedIds = getConnectedNodeIds(nodeId);
+    const fromLatLng = [selected.position.lat, selected.position.lon];
+
+    connectedIds.forEach(connId => {
+      const peer = state.nodes.get(connId);
+      if (!peer || !peer.position) return;
+
+      const toLatLng = [peer.position.lat, peer.position.lon];
+
+      // Determine SNR for tooltip (check both directions)
+      let snr = null;
+      if (selected.neighbors) {
+        const nb = selected.neighbors.find(n => n.nodeId === connId);
+        if (nb && nb.snr) snr = nb.snr;
+      }
+      if (snr === null && peer.neighbors) {
+        const nb = peer.neighbors.find(n => n.nodeId === nodeId);
+        if (nb && nb.snr) snr = nb.snr;
+      }
+
+      // Draw the line
+      const line = L.polyline([fromLatLng, toLatLng], {
+        color: '#06b6d4',
+        weight: 2.5,
+        opacity: 0.7,
+        dashArray: '8 6',
+        className: 'connection-line',
+      });
+
+      // Tooltip with connection info
+      const peerName = (peer.user && peer.user.longName) || peer.id;
+      let tooltipText = peerName;
+      if (snr !== null) tooltipText += ` (SNR: ${snr.toFixed(1)} dB)`;
+      line.bindTooltip(tooltipText, {
+        permanent: false,
+        direction: 'center',
+        className: 'connection-tooltip',
+      });
+
+      line.addTo(state.map);
+      state.connectionLines.push(line);
+    });
+  }
+
+  function clearConnectionLines() {
+    for (const line of state.connectionLines) {
+      state.map.removeLayer(line);
+    }
+    state.connectionLines = [];
   }
 
   function formatDuration(ms) {
