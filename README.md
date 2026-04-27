@@ -47,4 +47,4 @@ This application connects to the official public Meshtastic MQTT broker, listens
    - Public API: `API=true` (default). Set `API=false` to disable `/api/*` endpoints.
 
 3. **View the Dashboard**
-   Open your browser and navigate to `http://localhost:3000`.
+   Open your browser and navigate to `http://localhost:3000`. 
