@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package meshtastic;
+
+option java_package = "com.geeksville.mesh";
+
+import "meshtastic/mesh.proto";
+
+message ServiceEnvelope {
+  MeshPacket packet = 1;
+  string channel_id = 2;
+  string gateway_id = 3;
+}

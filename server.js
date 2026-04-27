@@ -1,0 +1,447 @@
+const express = require('express');
+const http = require('http');
+const mqtt = require('mqtt');
+const protobuf = require('protobufjs');
+const crypto = require('crypto');
+const WebSocket = require('ws');
+const path = require('path');
+
+// ─── Configuration ───────────────────────────────────────────────────────────
+const CONFIG = {
+  port: process.env.PORT || 3000,
+  mqtt: {
+    broker: 'mqtt://mqtt.meshtastic.org:1883',
+    topics: [
+      'msh/US/2/e/LongFast/#',
+      'msh/EU_868/2/e/LongFast/#',
+      'msh/IN/2/e/LongFast/#',
+      'msh/ANZ/2/e/LongFast/#',
+      'msh/KR/2/e/LongFast/#',
+      'msh/TW/2/e/LongFast/#',
+      'msh/RU/2/e/LongFast/#',
+      'msh/JP/2/e/LongFast/#',
+      'msh/CN/2/e/LongFast/#',
+      'msh/EU_433/2/e/LongFast/#',
+      'msh/US/2/map/#',
+      'msh/EU_868/2/map/#',
+    ],
+    options: {
+      clientId: `meshtastic-map-${Math.random().toString(16).slice(2, 10)}`,
+      clean: true,
+      connectTimeout: 30000,
+      reconnectPeriod: 5000,
+      username: 'meshdev',
+      password: 'large4cats',
+      protocolVersion: 4,
+    }
+  },
+  defaultKey: Buffer.from('AQ==', 'base64'),
+};
+
+// ─── In-Memory Node Store ────────────────────────────────────────────────────
+const nodes = new Map();
+let stats = { totalPackets: 0, positionPackets: 0, nodesWithPosition: 0 };
+const SERVER_STARTED_AT = Date.now();
+
+// ─── Time-Series History ─────────────────────────────────────────────────────
+// Records a snapshot every 10 seconds. Keeps all data since server start.
+const history = []; // { t: timestamp, n: nodeCount, p: totalPackets }
+const HISTORY_INTERVAL = 10000; // 10s
+
+function recordHistory() {
+  const count = [...nodes.values()].filter(n => n.position).length;
+  history.push({
+    t: Date.now(),
+    n: count,
+    p: stats.totalPackets,
+  });
+}
+
+// ─── Broadcast Throttle ─────────────────────────────────────────────────────
+let pendingUpdates = [];
+let broadcastTimer = null;
+const BROADCAST_INTERVAL = 500;
+
+function queueUpdate(update) {
+  pendingUpdates.push(update);
+  if (!broadcastTimer) {
+    broadcastTimer = setTimeout(flushUpdates, BROADCAST_INTERVAL);
+  }
+}
+
+function flushUpdates() {
+  broadcastTimer = null;
+  if (pendingUpdates.length === 0) return;
+  if (pendingUpdates.length === 1) {
+    broadcastToClients(pendingUpdates[0]);
+  } else {
+    broadcastToClients({ type: 'batch', updates: pendingUpdates, stats });
+  }
+  pendingUpdates = [];
+}
+
+// ─── Protobuf Setup ─────────────────────────────────────────────────────────
+let ServiceEnvelope, MeshPacket, Data, Position, User, Telemetry, NodeInfo, NeighborInfo, MapReport, PortNum;
+
+async function loadProtos() {
+  const root = new protobuf.Root();
+  root.resolvePath = (origin, target) => {
+    return path.join(__dirname, 'protos', target);
+  };
+  await root.load([
+    'meshtastic/mqtt.proto',
+    'meshtastic/mesh.proto',
+    'meshtastic/portnums.proto',
+  ]);
+  ServiceEnvelope = root.lookupType('meshtastic.ServiceEnvelope');
+  MeshPacket = root.lookupType('meshtastic.MeshPacket');
+  Data = root.lookupType('meshtastic.Data');
+  Position = root.lookupType('meshtastic.Position');
+  User = root.lookupType('meshtastic.User');
+  Telemetry = root.lookupType('meshtastic.Telemetry');
+  NodeInfo = root.lookupType('meshtastic.NodeInfo');
+  NeighborInfo = root.lookupType('meshtastic.NeighborInfo');
+  MapReport = root.lookupType('meshtastic.MapReport');
+  PortNum = root.lookupEnum('meshtastic.PortNum');
+  console.log('✅ Protobuf definitions loaded');
+}
+
+// ─── Decryption ──────────────────────────────────────────────────────────────
+function decrypt(encryptedBytes, packetId, fromId, key) {
+  try {
+    const nonce = Buffer.alloc(16);
+    nonce.writeUInt32LE(packetId, 0);
+    nonce.writeUInt32LE(fromId, 4);
+
+    let keyBuf = key;
+    if (keyBuf.length === 16) {
+      keyBuf = Buffer.concat([keyBuf, keyBuf]);
+    } else if (keyBuf.length === 1) {
+      const expanded = Buffer.alloc(16);
+      expanded[0] = keyBuf[0];
+      keyBuf = Buffer.concat([expanded, expanded]);
+    }
+
+    if (keyBuf.length < 32) {
+      const padded = Buffer.alloc(32);
+      keyBuf.copy(padded);
+      keyBuf = padded;
+    }
+
+    const decipher = crypto.createDecipheriv('aes-256-ctr', keyBuf.slice(0, 32), nonce);
+    return Buffer.concat([decipher.update(encryptedBytes), decipher.final()]);
+  } catch (err) {
+    return null;
+  }
+}
+
+// ─── Packet Processing ──────────────────────────────────────────────────────
+function nodeIdToHex(id) {
+  return '!' + id.toString(16).padStart(8, '0');
+}
+
+function processPosition(pos, nodeId) {
+  if (!pos) return null;
+  const lat = pos.latitudeI / 1e7;
+  const lon = pos.longitudeI / 1e7;
+  if (lat === 0 && lon === 0) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+  return { lat, lon, altitude: pos.altitude || 0, time: pos.time || 0, satsInView: pos.satsInView || 0 };
+}
+
+function processPacket(envelope) {
+  const packet = envelope.packet;
+  if (!packet) return;
+  stats.totalPackets++;
+
+  const fromId = packet.from;
+  const nodeHex = nodeIdToHex(fromId);
+
+  let data = null;
+
+  if (packet.decoded) {
+    data = packet.decoded;
+  } else if (packet.encrypted && packet.encrypted.length > 0) {
+    const decrypted = decrypt(packet.encrypted, packet.id, packet.from, CONFIG.defaultKey);
+    if (decrypted) {
+      try {
+        data = Data.decode(decrypted);
+      } catch (e) {
+        return;
+      }
+    }
+  }
+
+  if (!data || !data.portnum) return;
+
+  if (!nodes.has(nodeHex)) {
+    nodes.set(nodeHex, {
+      id: nodeHex,
+      num: fromId,
+      lastHeard: Date.now(),
+      position: null,
+      user: null,
+      telemetry: null,
+      snr: packet.rxSnr || 0,
+      rssi: packet.rxRssi || 0,
+      viaMqtt: packet.viaMqtt || false,
+      hopStart: packet.hopStart || 0,
+    });
+  }
+  const node = nodes.get(nodeHex);
+  node.lastHeard = Date.now();
+  node.snr = packet.rxSnr || node.snr;
+  node.rssi = packet.rxRssi || node.rssi;
+
+  let update = null;
+
+  const portnumValue = typeof data.portnum === 'number' ? data.portnum : data.portnum;
+
+  switch (portnumValue) {
+    case 3: // POSITION_APP
+      try {
+        const pos = Position.decode(data.payload);
+        const processed = processPosition(pos, nodeHex);
+        if (processed) {
+          node.position = processed;
+          stats.positionPackets++;
+          update = { type: 'position', node: serializeNode(node) };
+        }
+      } catch (e) {}
+      break;
+
+    case 4: // NODEINFO_APP
+      try {
+        const userInfo = User.decode(data.payload);
+        node.user = {
+          id: userInfo.id,
+          longName: userInfo.longName || '',
+          shortName: userInfo.shortName || '',
+          hwModel: userInfo.hwModel || 0,
+          role: userInfo.role || 0,
+        };
+        update = { type: 'nodeinfo', node: serializeNode(node) };
+      } catch (e) {}
+      break;
+
+    case 67: // TELEMETRY_APP
+      try {
+        const telemetry = Telemetry.decode(data.payload);
+        if (telemetry.deviceMetrics) {
+          node.telemetry = {
+            batteryLevel: telemetry.deviceMetrics.batteryLevel || 0,
+            voltage: telemetry.deviceMetrics.voltage || 0,
+            channelUtilization: telemetry.deviceMetrics.channelUtilization || 0,
+            airUtilTx: telemetry.deviceMetrics.airUtilTx || 0,
+            uptimeSeconds: telemetry.deviceMetrics.uptimeSeconds || 0,
+          };
+          update = { type: 'telemetry', node: serializeNode(node) };
+        }
+      } catch (e) {}
+      break;
+
+    case 73: // MAP_REPORT_APP
+      try {
+        const mapReport = MapReport.decode(data.payload);
+        if (mapReport.latitudeI && mapReport.longitudeI) {
+          const lat = mapReport.latitudeI / 1e7;
+          const lon = mapReport.longitudeI / 1e7;
+          if (Math.abs(lat) <= 90 && Math.abs(lon) <= 180 && !(lat === 0 && lon === 0)) {
+            node.position = { lat, lon, altitude: mapReport.altitude || 0, time: 0, satsInView: 0 };
+            stats.positionPackets++;
+          }
+        }
+        node.user = node.user || {};
+        node.user.longName = mapReport.longName || node.user.longName || '';
+        node.user.shortName = mapReport.shortName || node.user.shortName || '';
+        node.user.hwModel = mapReport.hwModel || node.user.hwModel || 0;
+        node.user.role = mapReport.role || node.user.role || 0;
+        node.mapReport = {
+          firmwareVersion: mapReport.firmwareVersion || '',
+          region: mapReport.region || 0,
+          modemPreset: mapReport.modemPreset || 0,
+          numOnlineLocalNodes: mapReport.numOnlineLocalNodes || 0,
+        };
+        update = { type: 'mapreport', node: serializeNode(node) };
+      } catch (e) {}
+      break;
+
+    case 71: // NEIGHBORINFO_APP
+      try {
+        const neighborInfo = NeighborInfo.decode(data.payload);
+        node.neighbors = (neighborInfo.neighbors || []).map(n => ({
+          nodeId: nodeIdToHex(n.nodeId),
+          snr: n.snr || 0,
+        }));
+        update = { type: 'neighborinfo', node: serializeNode(node) };
+      } catch (e) {}
+      break;
+  }
+
+  stats.nodesWithPosition = [...nodes.values()].filter(n => n.position).length;
+
+  if (update) {
+    queueUpdate(update);
+  }
+}
+
+function serializeNode(node) {
+  return {
+    id: node.id,
+    num: node.num,
+    lastHeard: node.lastHeard,
+    position: node.position,
+    user: node.user,
+    telemetry: node.telemetry,
+    snr: node.snr,
+    rssi: node.rssi,
+    mapReport: node.mapReport || null,
+    neighbors: node.neighbors || [],
+  };
+}
+
+// Compact serialization — strips nulls and empty arrays for faster transfer
+function serializeNodeCompact(node) {
+  const o = { id: node.id, lh: node.lastHeard };
+  if (node.position) o.p = [node.position.lat, node.position.lon, node.position.altitude || 0];
+  if (node.user) {
+    o.u = {};
+    if (node.user.longName) o.u.l = node.user.longName;
+    if (node.user.shortName) o.u.s = node.user.shortName;
+    if (node.user.hwModel) o.u.h = node.user.hwModel;
+    if (node.user.role) o.u.r = node.user.role;
+  }
+  if (node.telemetry && node.telemetry.batteryLevel) o.bat = node.telemetry.batteryLevel;
+  if (node.snr) o.snr = node.snr;
+  return o;
+}
+
+// ─── WebSocket Broadcasting ──────────────────────────────────────────────────
+let wss;
+
+function broadcastToClients(data) {
+  if (!wss) return;
+  const msg = JSON.stringify(data);
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  });
+}
+
+// ─── Express + HTTP Server ───────────────────────────────────────────────────
+const app = express();
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/api/nodes', (req, res) => {
+  const allNodes = [...nodes.values()]
+    .filter(n => n.position)
+    .map(serializeNode);
+  res.json({ nodes: allNodes, stats });
+});
+
+app.get('/api/stats', (req, res) => {
+  res.json(stats);
+});
+
+app.get('/api/history', (req, res) => {
+  res.json({ startedAt: SERVER_STARTED_AT, history });
+});
+
+// ─── Bootstrap ───────────────────────────────────────────────────────────────
+async function main() {
+  await loadProtos();
+
+  const server = http.createServer(app);
+
+  // WebSocket server
+  wss = new WebSocket.Server({ server });
+  wss.on('connection', (ws) => {
+    console.log('🌐 New WebSocket client connected');
+    // Send compact initial payload with history
+    const allNodes = [...nodes.values()].filter(n => n.position).map(serializeNodeCompact);
+    ws.send(JSON.stringify({
+      type: 'init',
+      nodes: allNodes,
+      stats,
+      startedAt: SERVER_STARTED_AT,
+      history,
+    }));
+
+    ws.on('close', () => {
+      console.log('🌐 WebSocket client disconnected');
+    });
+  });
+
+  // MQTT connection
+  console.log(`🔌 Connecting to MQTT broker: ${CONFIG.mqtt.broker}`);
+  const mqttClient = mqtt.connect(CONFIG.mqtt.broker, CONFIG.mqtt.options);
+
+  mqttClient.on('connect', () => {
+    console.log('✅ Connected to Meshtastic MQTT broker');
+    CONFIG.mqtt.topics.forEach(topic => {
+      mqttClient.subscribe(topic, (err) => {
+        if (err) {
+          console.error(`❌ Failed to subscribe to ${topic}:`, err);
+        } else {
+          console.log(`📡 Subscribed to: ${topic}`);
+        }
+      });
+    });
+  });
+
+  let msgCount = 0;
+  mqttClient.on('message', (topic, message) => {
+    msgCount++;
+    if (msgCount <= 5 || msgCount % 100 === 0) {
+      console.log(`📨 MQTT msg #${msgCount} topic=${topic} len=${message.length}`);
+    }
+    try {
+      const envelope = ServiceEnvelope.decode(message);
+      processPacket(envelope);
+    } catch (err) {
+      if (msgCount <= 5) {
+        console.error(`❌ Decode error on msg #${msgCount}:`, err.message);
+      }
+    }
+  });
+
+  mqttClient.on('error', (err) => {
+    console.error('❌ MQTT error:', err.message);
+  });
+
+  mqttClient.on('reconnect', () => {
+    console.log('🔄 Reconnecting to MQTT broker...');
+  });
+
+  // Start HTTP server
+  server.listen(CONFIG.port, () => {
+    console.log(`\n📊 Meshtastic Statistics running at http://localhost:${CONFIG.port}`);
+    console.log('─'.repeat(50));
+  });
+
+  // Record history snapshot every 10s
+  setInterval(recordHistory, HISTORY_INTERVAL);
+  // Record first point immediately
+  recordHistory();
+
+  // Periodic stats logging
+  setInterval(() => {
+    console.log(`📊 Nodes: ${nodes.size} | With Position: ${stats.nodesWithPosition} | Total Packets: ${stats.totalPackets} | History Points: ${history.length}`);
+  }, 30000);
+
+  // Periodic cleanup of stale nodes (older than 24 hours)
+  setInterval(() => {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [key, node] of nodes) {
+      if (node.lastHeard < cutoff) {
+        nodes.delete(key);
+      }
+    }
+  }, 60 * 60 * 1000);
+}
+
+main().catch(err => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});

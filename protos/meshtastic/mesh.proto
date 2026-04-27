@@ -1,0 +1,281 @@
+syntax = "proto3";
+
+package meshtastic;
+
+option java_package = "com.geeksville.mesh";
+
+import "meshtastic/portnums.proto";
+
+// A position message
+message Position {
+  sfixed32 latitude_i = 1;
+  sfixed32 longitude_i = 2;
+  int32 altitude = 3;
+  int32 time = 4;
+  uint32 timestamp = 16;
+
+  int32 altitude_hae = 11;
+  int32 altitude_geoidal_separation = 12;
+  uint32 PDOP = 5;
+  uint32 HDOP = 6;
+  uint32 VDOP = 7;
+  uint32 gps_accuracy = 8;
+  uint32 ground_speed = 9;
+  uint32 ground_track = 10;
+  uint32 fix_quality = 13;
+  uint32 fix_type = 14;
+  uint32 sats_in_view = 15;
+  uint32 sensor_id = 17;
+  uint32 next_update = 18;
+  uint32 seq_number = 19;
+  int32 precision_bits = 20;
+}
+
+message User {
+  string id = 1;
+  string long_name = 2;
+  string short_name = 3;
+  bytes macaddr = 4;
+  HardwareModel hw_model = 5;
+  bool is_licensed = 6;
+  Role role = 7;
+}
+
+enum HardwareModel {
+  UNSET = 0;
+  TLORA_V2 = 1;
+  TLORA_V1 = 2;
+  TLORA_V2_1_1P6 = 3;
+  TBEAM = 4;
+  HELTEC_V2_0 = 5;
+  TBEAM_V0P7 = 6;
+  T_ECHO = 7;
+  TLORA_V1_1P3 = 8;
+  RAK4631 = 9;
+  HELTEC_V2_1 = 10;
+  HELTEC_V1 = 11;
+  LILYGO_TBEAM_S3_CORE = 12;
+  RAK11200 = 13;
+  NANO_G1 = 14;
+  TLORA_V2_1_1P8 = 15;
+  TLORA_T3_S3 = 16;
+  NANO_G1_EXPLORER = 17;
+  NANO_G2_ULTRA = 18;
+  LORA_TYPE = 19;
+  WIPHONE = 20;
+  WIO_WM1110 = 21;
+  RAK2560 = 22;
+  HELTEC_HRU_3601 = 23;
+  STATION_G1 = 25;
+  RAK11310 = 26;
+  SENSELORA_RP2040 = 27;
+  SENSELORA_S3 = 28;
+  CANARYONE = 29;
+  RP2040_LORA = 30;
+  STATION_G2 = 31;
+  LORA_RELAY_V1 = 32;
+  NRF52840DK = 33;
+  PPR = 34;
+  GENIEBLOCKS = 35;
+  NRF52_UNKNOWN = 36;
+  PORTDUINO = 37;
+  ANDROID_SIM = 38;
+  DIY_V1 = 39;
+  NRF52840_PCA10059 = 40;
+  DR_DEV = 41;
+  M5STACK = 42;
+  HELTEC_V3 = 43;
+  HELTEC_WSL_V3 = 44;
+  BETAFPV_2400_TX = 45;
+  BETAFPV_900_NANO_TX = 46;
+  RPI_PICO = 47;
+  HELTEC_WIRELESS_TRACKER = 48;
+  HELTEC_WIRELESS_PAPER = 49;
+  T_DECK = 50;
+  T_WATCH_S3 = 51;
+  PICOMPUTER_S3 = 52;
+  HELTEC_HT62 = 53;
+  EBYTE_ESP32_S3 = 54;
+  ESP32_S3_PICO = 55;
+  CHATTER_2 = 56;
+  HELTEC_WIRELESS_PAPER_V1_0 = 57;
+  HELTEC_WIRELESS_TRACKER_V1_0 = 58;
+  UNPHONE = 59;
+  TD_LORAC = 60;
+  CDEBYTE_EORA_S3 = 61;
+  TWC_MESH_V4 = 62;
+  NRF52_PROMICRO_DIY = 63;
+  RADIOMASTER_900_BANDIT_NANO = 64;
+  HELTEC_CAPSULE_SENSOR_V3 = 65;
+  HELTEC_VISION_MASTER_T190 = 66;
+  HELTEC_VISION_MASTER_E213 = 67;
+  HELTEC_VISION_MASTER_E290 = 68;
+  HELTEC_MESH_NODE_T114 = 69;
+  SENSECAP_INDICATOR = 70;
+  TRACKER_T1000_E = 71;
+  RAK3172 = 72;
+  WIO_E5 = 73;
+  RADIOMASTER_900_BANDIT = 74;
+  ME25LS01_4Y10TD = 75;
+  RP2040_FEATHER_RFM95 = 76;
+  M5STACK_COREBASIC = 77;
+  M5STACK_CORE2 = 78;
+  PRIVATE_HW = 255;
+}
+
+enum Role {
+  CLIENT = 0;
+  CLIENT_MUTE = 1;
+  ROUTER = 2;
+  ROUTER_CLIENT = 3;
+  REPEATER = 4;
+  TRACKER = 5;
+  SENSOR = 6;
+  TAK = 7;
+  CLIENT_HIDDEN = 8;
+  LOST_AND_FOUND = 9;
+  TAK_TRACKER = 10;
+}
+
+message Data {
+  PortNum portnum = 1;
+  bytes payload = 2;
+  bool want_response = 3;
+  uint32 dest = 4;
+  uint32 source = 5;
+  uint32 request_id = 6;
+  uint32 reply_id = 7;
+  fixed32 emoji = 8;
+}
+
+message Waypoint {
+  uint32 id = 1;
+  sfixed32 latitude_i = 2;
+  sfixed32 longitude_i = 3;
+  uint32 expire = 4;
+  uint32 locked_to = 5;
+  string name = 6;
+  string description = 7;
+  fixed32 icon = 8;
+}
+
+message MeshPacket {
+  fixed32 from = 1;
+  fixed32 to = 2;
+  uint32 channel = 3;
+
+  oneof payload_variant {
+    Data decoded = 4;
+    bytes encrypted = 5;
+  }
+
+  fixed32 id = 6;
+  fixed32 rx_time = 7;
+  float rx_snr = 8;
+  uint32 hop_limit = 9;
+  bool want_ack = 10;
+  Priority priority = 11;
+  int32 rx_rssi = 12;
+  bool delayed = 13;
+  bool via_mqtt = 14;
+  uint32 hop_start = 15;
+
+  enum Priority {
+    UNSET = 0;
+    MIN = 1;
+    BACKGROUND = 10;
+    DEFAULT = 64;
+    RELIABLE = 70;
+    ACK = 120;
+    MAX = 127;
+  }
+}
+
+message NodeInfo {
+  uint32 num = 1;
+  User user = 2;
+  Position position = 3;
+  float snr = 4;
+  fixed32 last_heard = 5;
+  DeviceMetrics device_metrics = 6;
+  uint32 channel = 7;
+  bool via_mqtt = 8;
+  uint32 hops_away = 9;
+  bool is_favorite = 10;
+}
+
+message DeviceMetrics {
+  uint32 battery_level = 1;
+  float voltage = 2;
+  float channel_utilization = 3;
+  float air_util_tx = 4;
+  uint32 uptime_seconds = 5;
+}
+
+message EnvironmentMetrics {
+  float temperature = 1;
+  float relative_humidity = 2;
+  float barometric_pressure = 3;
+  float gas_resistance = 4;
+  float voltage = 5;
+  float current = 6;
+  float iaq = 7;
+  float distance = 8;
+  float lux = 9;
+  float white_lux = 10;
+  float ir_lux = 11;
+  float uv_lux = 12;
+  float wind_direction = 13;
+  float wind_speed = 14;
+  float weight = 15;
+  float wind_gust = 16;
+  float wind_lull = 17;
+}
+
+message PowerMetrics {
+  float ch1_voltage = 1;
+  float ch1_current = 2;
+  float ch2_voltage = 3;
+  float ch2_current = 4;
+  float ch3_voltage = 5;
+  float ch3_current = 6;
+}
+
+message Telemetry {
+  fixed32 time = 1;
+  oneof variant {
+    DeviceMetrics device_metrics = 2;
+    EnvironmentMetrics environment_metrics = 3;
+    PowerMetrics power_metrics = 6;
+  }
+}
+
+message NeighborInfo {
+  uint32 node_id = 1;
+  uint32 last_sent_by_id = 2;
+  uint32 node_broadcast_interval_secs = 3;
+  repeated Neighbor neighbors = 4;
+}
+
+message Neighbor {
+  uint32 node_id = 1;
+  float snr = 2;
+  float last_rx_time = 3;
+  uint32 node_broadcast_interval_secs = 4;
+}
+
+message MapReport {
+  string long_name = 1;
+  string short_name = 2;
+  Role role = 3;
+  HardwareModel hw_model = 4;
+  string firmware_version = 5;
+  uint32 region = 6;
+  uint32 modem_preset = 7;
+  bool has_default_channel = 8;
+  sfixed32 latitude_i = 9;
+  sfixed32 longitude_i = 10;
+  int32 altitude = 11;
+  uint32 position_precision = 12;
+  uint32 num_online_local_nodes = 13;
+}
